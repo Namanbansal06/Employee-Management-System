@@ -1,0 +1,221 @@
+Project Description
+========================================================================================================================
+
+Dataset Description
+========================================================================================================================
+- employee_data.csv, this is a sample data file for employee data, consider that incremental files are provided in
+similar manner at 00:00UTC through S3 folder "S3://{bucket-name}/{emp-data}/". data clarity - high. File will come once
+a day only.
+
+- employee_timeframe_data.csv, employee_timeframe_data_1.csv, these files provide information about a particular
+employee's time at particular designation with particular salary. data clarity - medium. The second file is an
+incremental sample. The incremental file will be provided at 00:00UTC through S3 folder
+"S3://{bucket-name}/{emp-time-data}/". The file will come once a day only. The start_date and end_date have been
+provided as unix timestamp.
+
+- employee_leave_quota_data.csv, this file represent the leave quota allocated to every employee every year. The file
+has a frequency of an year.
+
+- employee_leave_calendar_data.csv, this file represent the mandatory holidays for the year. This leaves are above and
+over allocated leave quota for employee. The refresh frequency is yearly on 1st jan.
+
+- employee_leave_data.csv, this file represents the actual leaves applied or taken. This has a refresh frequency
+everyday at 07:00UTC.
+
+- vocab.json, this file contains the all words used in the messages by employees
+
+- marked_word.json, this file contains the words which are reserved.
+
+- message.json, sample messages which will be coming through kafka servers.
+
+Requirement Description
+========================================================================================================================
+- Create an append only incremental table from employee data have following data, emp_id, age and name. The pipeline			DONE
+will be scheduled to run at 07:00UTC.
+
+- Create an incremental table from employee time data with following data, emp_id, start_date, end_date, designation,
+salary, status. There shall not be any duplicate row by considering these columns emp_id, start_date, end_date. In case
+there is, consider the one with highest salary and a corresponding designation to it. convert the unix timestamp to			DONE
+nearest date without timestamp. The start date and end date should be in continuity, i.e end date of previous record
+for an employee should be start date of next record. records where end date is not present are to be marked with
+status 'ACTIVE' and others to be 'INACTIVE'. Definition of continuity - when an incremental record is obtained for an
+employee the previous record shall be closed with start date of record received and it should be marked "INACTIVE".
+The pipeline will be scheduled to run at 07:00UTC.
+
+- Create an append only yearly incremental table for leave quota allocated to employees.						DONE
+
+- Create an append only yearly incremental table for leave calendar.									DONE
+
+- Create a daily update (07:00UTC) table keeping a check on leaves taken or applied by the employee.					DONE
+
+- Create a table to report currently active employee by designation. This should be update at 07:00UTC everyday.			DONE
+The table will contain the following columns, designation, no_of_active_emp
+
+- Find all the employees who have potential leaves greater than 8% of working days in the year. Year starting is
+counted from 1st Jan. Any leave applied on holiday day by calendar is ignored. Working days exclude holidays and			DONE
+weekends. Employee can also call for cancellation of leaves. Ignore duplicate applied leaves also.
+This table should be able to report the 2 columns emp_id and upcoming_leaves and should have fresh data by 07:00 UTC.
+
+- Find the percentage of quota of leaves used by employees for the year (availed leaves only). If the availed quota is			LEFT
+greater than 80%. Send a mail to the manager assuming you are manager. (Do not send actual mails rather generate a text
+file as an alternative.) This job needs to run on 1st of every month at 07:00UTC. If the job breaks in between
+duplicate emails should not be sent.
+
+- Design a streaming system which will flag certain messages sent from one employee to another. Maintain a history
+of all such message. Keeping an active count of the specific messages done and received by each employee. Counting
+each message as one strike and deduct the salary by 10%. There is also a cooldown activity in the system at
+every month start where strike is removed and salary is restored to previous strike or actual if there was only one
+strike. If there are no strike salary will remain as is. At any point of time these tables can be referred and				DONE
+should have following the details. Please keep in mind salary update on each strike will be represent by a separate
+column alongside the emp_id in the resultant table. In case employee has reached 10 strikes toggle the employee status
+to inactive and cooldown will not apply to such employee in this case. Assume the source of this system is a kafka
+stream. please consider kafka timestamp as message timestamp. Kafka message will be json format as {
+"sender" : "{emp_id}", "receiver" : "{emp_id}", "message" : "message body"
+}
+
+Notes :
+1. Please design the system as per DWH principles. It should scalable and fault tolerant.
+2. This system should work end to end on AWS.
+3. In case you plan to use a DB. you can install it on an ec2 instance.
+4. Please also create ER diagram for the system you have designed.
+5. Try to use as appropriate element from the stack as you can.
+
+
+from airflow import DAG
+from airflow.models import Variable 
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.dummy import DummyOperator
+from airflow.utils.dates import days_ago
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+from datetime import datetime
+
+def schedule_branch(**kwargs):
+    date = kwargs['execution_date']
+    branches = []
+    if date.day == 1:
+        branches.append('run_monthly_jobs')
+    else:
+        branches.append('skip_monthly_jobs')
+    if date.month == 1 and date.day == 1:
+        branches.append('run_yearly_jobs')
+    else:
+        branches.append('skip_yearly_jobs')
+    return branches
+
+default_args = {
+    'owner': 'airflow',
+    'start_date': days_ago(1),
+}
+
+# Define script arguments once
+script_args = {
+    '--db_user': Variable.get('db_user'),
+    '--db_pass': Variable.get('db_pass'),
+    '--db_host': Variable.get('db_host'),
+    '--pg_url': Variable.get('pg_url'),
+    '--curr_ts': Variable.get('curr_ts'),
+    '--start_date': Variable.get('start_date'),
+    '--end_of_year': Variable.get('end_of_year'),
+    '--start_of_year': Variable.get('start_of_year'),
+    '--today': Variable.get('today'),
+    '--CURRENT_YEAR': Variable.get('CURRENT_YEAR'),
+}
+
+with DAG(
+    dag_id='naman',
+    default_args=default_args,
+    schedule_interval='0 7 * * *',
+    catchup=False,
+    tags=['aws', 'glue'],
+) as dag:
+
+    daily_check_done = DummyOperator(task_id='daily_check_done')
+
+    # ---------------- DAILY JOBS ----------------
+    run_emp_data = GlueJobOperator(
+        task_id='run_gp4_emp_data_transformation',
+        job_name='gp4_emp_data_transformation',
+        region_name='us-east-1',
+        script_args=script_args,
+    )
+
+    run_emp_time = GlueJobOperator(
+        task_id='run_gp4_emp_time_data_transformation',
+        job_name='gp4_emp_time_data_transformation',
+        region_name='us-east-1',
+        script_args=script_args,
+    )
+
+    run_emp_leave = GlueJobOperator(
+        task_id='run_gp4_emp_leave_data',
+        job_name='gp4_emp_leave_data',
+        region_name='us-east-1',
+        script_args=script_args,
+    )
+
+    run_upcoming_leave = GlueJobOperator(
+        task_id='run_gp4_emp_upcoming_leave_check',
+        job_name='gp4_emp_upcoming_leave_check',
+        region_name='us-east-1',
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+        script_args=script_args,
+    )
+
+    run_daily_report = GlueJobOperator(
+        task_id='run_gp4_daily_active_employee_report',
+        job_name='gp4_daily_active_employee_report',
+        region_name='us-east-1',
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+        script_args=script_args,
+    )
+
+    # Set daily dependencies
+    [run_emp_data, run_emp_time, run_emp_leave] >> run_upcoming_leave >> run_daily_report >> daily_check_done
+
+    # ---------------- SCHEDULE CHECK ----------------
+    schedule_check = BranchPythonOperator(
+        task_id='schedule_check',
+        python_callable=schedule_branch,
+        provide_context=True,
+    )
+    daily_check_done >> schedule_check
+
+    # ---------------- MONTHLY JOB ----------------
+    run_monthly_jobs = DummyOperator(task_id='run_monthly_jobs')
+    skip_monthly_jobs = DummyOperator(task_id='skip_monthly_jobs')
+
+    run_monthly = GlueJobOperator(
+        task_id='run_gp4_emp_max_availed_leave_check',
+        job_name='gp4_emp_max_availed_leave_check',
+        region_name='us-east-1',
+        script_args=script_args,
+    )
+
+    run_monthly_jobs >> run_monthly
+
+    # ---------------- YEARLY JOBS ----------------
+    run_yearly_jobs = DummyOperator(task_id='run_yearly_jobs')
+    skip_yearly_jobs = DummyOperator(task_id='skip_yearly_jobs')
+
+    run_yearly_1 = GlueJobOperator(
+        task_id='run_gp4_emp_leave_calender',
+        job_name='gp4_emp_leave_calender',
+        region_name='us-east-1',
+        script_args=script_args,
+    )
+
+    run_yearly_2 = GlueJobOperator(
+        task_id='run_gp4_emp_leave_quota',
+        job_name='gp4_emp_leave_quota',
+        region_name='us-east-1',
+        script_args=script_args,
+    )
+
+    run_yearly_jobs >> [run_yearly_1, run_yearly_2]
+
+    # ---------------- BRANCH LOGIC ----------------
+    schedule_check >> [run_monthly_jobs, skip_monthly_jobs, run_yearly_jobs, skip_yearly_jobs]
+
+
+
