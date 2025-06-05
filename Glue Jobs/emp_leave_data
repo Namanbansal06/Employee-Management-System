@@ -1,0 +1,178 @@
+import sys
+import boto3
+from datetime import datetime
+from pyspark.context import SparkContext
+from pyspark.sql import *
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from awsglue.job import Job
+
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init("JOB_NAME",args)
+
+bucket_name = "poc-bootcamp-capstone-group4"
+bronze_path = f"s3://{bucket_name}/bronze/emp_leave_data/unprocessed/"
+processed_path = f"s3://{bucket_name}/bronze/emp_leave_data/processed/"
+
+# Load existing data from PostgreSQL
+pg_url = pg_url
+pg_properties = {
+    "user": db_user,
+    "password": db_pass,
+    "driver": "org.postgresql.Driver"
+}
+table_name = "emp_time_data"
+table_name2 = "emp_leave_data"
+
+print(f"Reading files from: {bronze_path}")
+
+schema = StructType([
+    StructField("emp_id", LongType(), True),
+    StructField("date", StringType(), True),
+    StructField("status", StringType(), True)
+])
+
+today_df = spark.read.option("header", "true").schema(schema).csv(bronze_path)
+
+s3 = boto3.client('s3')
+prefix = "bronze/emp_leave_data/unprocessed/"
+
+response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+
+if 'Contents' not in response or all(obj['Key'].endswith('/') for obj in response['Contents']):
+    print("No files found in the bronze/unprocessed path. Exiting the job.")
+    job.commit()
+    
+else:
+    
+    try:
+        emp_time_df = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+        print("data fetch from db successfuly")
+    except:
+        print("failed to fetch db")
+    
+    active_emp_ids_df = emp_time_df.filter(col("status") == "ACTIVE").select("emp_id").distinct()
+    
+    # Step 2: Use left semi join to filter df without bringing in columns from emp_time_df
+    today_df = today_df.join(active_emp_ids_df, "emp_id", 'left_semi')
+    
+    today_date = datetime.utcnow().strftime('%Y-%m-%d')
+    today_df = today_df.withColumn("ingest_date", lit(today_date)).withColumn("ingest_timestamp", current_timestamp())
+
+    
+    try:
+        historical_df = spark.read.jdbc(url=pg_url, table=table_name2, properties=pg_properties)
+        combined_df = historical_df.unionByName(today_df)
+        print("naman this is an existing psql db",historical_df.show())
+    
+    except Exception as e:
+        print("No historical data found or error reading:", str(e))
+        combined_df = today_df
+    
+    # Step 1: Count ACTIVE and CANCELLED per (emp_id, date)
+    status_count_df = combined_df.withColumn(
+        "is_cancelled", when(col("status") == "CANCELLED", 1).otherwise(0)
+    ).withColumn(
+        "is_active", when(col("status") == "ACTIVE", 1).otherwise(0)
+    ).groupBy("emp_id", "date").agg(
+        sum("is_cancelled").alias("cancelled_count"),
+        sum("is_active").alias("active_count")
+    )
+    
+    # Step 2: Decide final status (CANCELLED wins on tie)
+    final_status_df = status_count_df.withColumn(
+        "final_status",
+        when(col("cancelled_count") >= col("active_count"), lit("CANCELLED")).otherwise(lit("ACTIVE")))
+    
+    # Step 3: Join back and filter only records matching final status
+    filtered_df = combined_df.join(
+        final_status_df.select("emp_id", "date", "final_status"),
+        on=["emp_id", "date"]
+    ).filter(
+        col("status") == col("final_status")
+    )
+    
+    # Step 4: Deduplicate using latest timestamp
+    window_spec = Window.partitionBy("emp_id", "date").orderBy(col("ingest_timestamp").desc())
+    
+    deduped_df = filtered_df.withColumn("row_num", row_number().over(window_spec)) \
+                            .filter(col("row_num") == 1) \
+                            .drop("row_num", "final_status")
+    
+    try:
+        deduped_df.write.jdbc(
+            url=pg_url,
+            table=table_name2,
+            mode="append",
+            properties=pg_properties
+        )
+        print("Data successfully written to PostgreSQL table:", table_name2)
+    except Exception as e:
+        print("Error while writing to PostgreSQL table:", table_name2)
+        print("Exception message:", str(e))
+    
+    # Step 6: Move Files to Processed
+    s3 = boto3.client('s3')
+    
+    bronze_unprocessed_prefix = "bronze/emp_leave_data/unprocessed/"
+    bronze_processed_prefix = "bronze/emp_leave_data/processed/"
+    
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=bronze_unprocessed_prefix)
+    
+    if 'Contents' in response:
+        for obj in response['Contents']:
+            source_key = obj['Key']
+            if source_key.endswith('/'):
+                continue  # Skip folders
+    
+            file_name = source_key.split('/')[-1]
+            destination_key = f"{bronze_processed_prefix}{file_name}"
+    
+            # Copy
+            s3.copy_object(
+                Bucket=bucket_name,
+                CopySource={'Bucket': bucket_name, 'Key': source_key},
+                Key=destination_key
+            )
+    
+            # Delete original
+            s3.delete_object(Bucket=bucket_name, Key=source_key)
+    
+            print(f"Moved {source_key} ➝ {destination_key}")
+    else:
+        print("No files found in bronze/unprocessed.")
+    
+    job.commit()

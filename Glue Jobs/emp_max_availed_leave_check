@@ -1,0 +1,199 @@
+import sys
+from datetime import *
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.sql.functions import *
+from pyspark.sql import *
+from pyspark.sql.types import *
+
+# Glue initialization
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Paths and Config
+pg_url = pg_url
+pg_properties = {
+    "user": db_user,
+    "password": db_pass,
+    "driver": "org.postgresql.Driver"
+}
+table_name = "emp_leave_data"
+table_name2 = "emp_leave_calendar"
+table_name3 = "emp_max_availed_leave_check"
+table_name4 = "emp_leave_quota"
+
+alert_output_path = "s3://poc-bootcamp-capstone-group4/gold/leave_alert_emails/"
+alert_tracking_path = alert_output_path + "alerted_employees.parquet"
+
+CURRENT_YEAR = int(CURRENT_YEAR)
+today = datetime.strptime(today, "%Y-%m-%d").date()
+start_of_year = datetime.strptime(start_of_year, "%Y-%m-%d").date()
+
+# Read leave data
+leave_df = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+leave_df = leave_df.withColumn("date", to_date(col("date"))) \
+                   .filter((col("status") == "ACTIVE") & (col("date") >= lit(start_of_year)) & (col("date") <= lit(today))) \
+                   .withColumn("day_of_week", dayofweek("date")) \
+                   .filter((col("day_of_week") != 1) & (col("day_of_week") != 7))  # 1=Sunday, 7=Saturday
+
+
+# Read holiday data
+holiday_df = spark.read.jdbc(url=pg_url, table=table_name2, properties=pg_properties)
+holiday_df = holiday_df.withColumn("holiday_date", to_date(col("date"))).filter(year(col("holiday_date")) == CURRENT_YEAR).select("holiday_date").dropDuplicates()
+holiday_df = holiday_df.drop("date")
+
+# Exclude holidays from leaves
+leave_df = leave_df.join(broadcast(holiday_df), leave_df.date == holiday_df.holiday_date, "left_anti")
+
+try:
+    # Collect holiday dates into a list
+    if not holiday_df.rdd.isEmpty():
+        holiday_list = [row['holiday_date'] for row in holiday_df.select("holiday_date").collect()]
+    else:
+        print("⚠️ Warning: Holiday calendar is empty!")
+        holiday_list = []
+
+    # Generate working day list
+    working_days = []
+    current = start_of_year
+    while current <= today:
+        if current.weekday() < 5 and current not in holiday_list:  # Mon-Fri
+            working_days.append(Row(date=current))
+        current += timedelta(days=1)
+
+    # Convert list to DataFrame
+    schema = StructType([StructField("date", DateType(), True)])
+    working_days_df = spark.createDataFrame(working_days, schema=schema)
+    working_days_count = working_days_df.count()
+    print("wdc", working_days_count)
+
+except Exception as e:
+    print(f"Error calculating working days: {str(e)}")
+    working_days_count = 0
+    job.commit()
+
+# Calculate employee leave counts
+leave_count_df = leave_df.groupBy("emp_id").agg(countDistinct("date").alias("leave_count"))
+
+
+# Read leave quota
+leave_quota_df = spark.read.jdbc(url=pg_url, table=table_name4, properties=pg_properties)
+leave_quota_df = leave_quota_df.withColumn("year", col("year").cast("int")) \
+                               .filter(col("year") == CURRENT_YEAR) \
+                               .select("emp_id", "leave_quota")
+
+# Join and calculate leave usage %
+leave_usage_df = leave_count_df.join(leave_quota_df, on="emp_id", how="inner")
+leave_usage_df = leave_usage_df.withColumn(
+    "used_percent", (col("leave_count") / col("leave_quota")) * 100
+)
+employee_leaves = leave_usage_df.filter(col("emp_id") == '1226091381')
+print(employee_leaves.show())
+
+# Filter employees who crossed 80% usage
+
+high_usage_df = leave_usage_df.filter(col("used_percent") >= 80)
+
+# Show result
+print("🔔 Employees who used more than 80% of their leave quota:")
+high_usage_df.select("emp_id", "leave_count", "leave_quota", "used_percent") \
+             .orderBy("used_percent", ascending=False).show(truncate=False)
+
+# writing into db
+try:
+    high_usage_df.write.jdbc(
+        url=pg_url,
+        table=table_name3,
+        mode="overwrite",
+        properties=pg_properties
+    )
+    print("Data successfully written to PostgreSQL table:", table_name3)
+except Exception as e:
+    print("Error while writing to PostgreSQL table:", table_name3)
+    print("Exception message:", str(e))
+
+# Avoid duplicate alerts
+high_usage_df = high_usage_df.withColumn("year", lit(CURRENT_YEAR))
+
+try:
+    alerted_emps_df = spark.read.parquet(alert_tracking_path)
+    alerted_emps_df = alerted_emps_df.filter(col("year") == CURRENT_YEAR)
+except:
+    alerted_emps_df = spark.createDataFrame([], high_usage_df.schema)
+
+new_alerts_df = high_usage_df.join(
+    alerted_emps_df.select("emp_id","year"),
+    on=["emp_id", "year"],
+    how="left_anti"
+)
+
+# print("new_alerts_df", new_alerts_df.show())
+
+# Simulate email alert content
+email_content_df = new_alerts_df.withColumn(
+    "message",
+    concat_ws(
+        " ",
+        lit("Dear Manager,"),
+        lit("Employee with ID"),
+        col("emp_id"),
+        lit("has used"),
+        round(col("used_percent"), 2),
+        lit(f"% of their leave quota in {CURRENT_YEAR}.")
+    )
+).select("emp_id", "message")
+
+# Save alerts to Gold and track them
+try:
+    if email_content_df.count() > 0:
+        email_content_df.select(col("message").alias("value")) \
+            .write.mode("append") \
+            .text(alert_output_path + f"emails/year={CURRENT_YEAR}")
+    
+        new_alerts_df.select("emp_id", "leave_count", "leave_quota", "used_percent", "year") \
+            .write.mode("append").parquet(alert_tracking_path)
+
+
+    print("alerts and tracking info successfully written to PostgreSQL.")
+
+except Exception as e:
+    
+    print("error while writing alerts to  Gold")
+    print("Exception:", str(e))
+email_content_df.show(truncate=False)
+
+job.commit()

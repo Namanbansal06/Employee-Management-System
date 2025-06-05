@@ -1,0 +1,217 @@
+import sys
+import boto3
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from awsglue.job import Job
+from datetime import datetime
+import psycopg2
+
+# Glue boilerplate
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+
+bucket_name = "poc-bootcamp-capstone-group4"
+bronze_path = f"s3://{bucket_name}/bronze/emp_data/unprocessed/"
+bronze_path_pro = f"s3://{bucket_name}/bronze/emp_data/processed/"
+
+# Connect to PostgreSQL with psycopg2
+conn = psycopg2.connect(
+    dbname="postgres_capstone",
+    user=db_user,
+    password=db_pass,
+    host=db_host,
+    port="5432"
+)
+cur = conn.cursor()
+
+try:
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+    job = Job(glueContext)
+    job.init(args['JOB_NAME'], args)
+except Exception as e:
+    print("Initialization error:", str(e))
+    raise
+
+# Read CSV from Bronze
+try:
+    schema = StructType([
+    StructField("name", StringType(), True),
+    StructField("age", IntegerType(), True),
+    StructField("emp_id", StringType(), True)
+    ])
+    df = spark.read.option("header", True).schema(schema).csv(bronze_path)
+    print("Raw data read successfully.")
+except Exception as e:
+    print("Error reading from bronze path:", str(e))
+    raise
+
+s3 = boto3.client('s3')
+prefix = "bronze/emp_data/unprocessed/"
+
+response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+
+if 'Contents' not in response or all(obj['Key'].endswith('/') for obj in response['Contents']):
+    print("No files found in the bronze/unprocessed path. Exiting the job.")
+    job.commit()
+else:
+    
+    # Transformations
+    try:
+        df = df.dropDuplicates(["emp_id"])
+        df = df.filter((col("age").isNotNull()) & (col("age") > 0) & (col("age") < 100))
+        df = df.dropna(subset=["emp_id", "name", "age"])
+        
+        print("Transformed data:")
+    except Exception as e:
+        print("Transformation error:", str(e))
+        raise
+    
+    # Merge with DB (Optimized using emp_id filtering)
+    try:
+        emp_ids = df.select("emp_id").distinct()
+        
+        # Load existing data from PostgreSQL
+        pg_url = pg_url
+        pg_properties = {
+            "user": db_user,
+            "password": db_pass,
+            "driver": "org.postgresql.Driver"
+        }
+        table_name = "emp_data_trans"
+        normal_df_existing = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+        
+        try:
+            cur.execute("BEGIN;")
+            cur.execute("INSERT INTO emp_data_trans_backup (emp_id,name,age) SELECT emp_id,name,age FROM emp_data_trans;")
+            cur.execute("COMMIT;")
+            
+            print("emp_data_trans_backup Query executed successfully.")
+            print(cur.statusmessage)
+        
+        except Exception as e:
+            cur.execute("ROLLBACK;")
+            print("Error:", e)
+            
+        try:
+            df_existing = spark.read.jdbc(url=pg_url, table="emp_data_trans_backup", properties=pg_properties)
+            print("naman this is an existing psql db",df_existing.count())
+            
+            df_existing_matched = df_existing.join(emp_ids, on="emp_id", how="inner")
+            df_existing_unmatched = df_existing.join(emp_ids, on="emp_id", how="left_anti")
+            df_merged = df_existing_unmatched.unionByName(df)
+            print("df_merged", df_merged.count())
+            
+        except Exception as e:
+            print("No historical data found or error reading:", str(e))
+            df_merged = df
+    
+    except Exception as e:
+        print("Error", str(e))
+        raise
+    
+    try:
+        if df_merged.rdd.isEmpty():
+            print("Transformed DataFrame is empty. Restoring original data from backup.")
+            
+            # Write backup data back
+            normal_df_existing.write \
+                .format("jdbc") \
+                .option("url", pg_url) \
+                .option("dbtable", "emp_data_trans") \
+                .option("user", db_user) \
+                .option("password", db_pass) \
+                .option("driver", "org.postgresql.Driver") \
+                .mode("overwrite") \
+                .save()
+        else:
+            print("Writing transformed data to df_existing...")
+            df_merged.write \
+                .format("jdbc") \
+                .option("url", pg_url) \
+                .option("dbtable", "emp_data_trans") \
+                .option("user", db_user) \
+                .option("password", db_pass) \
+                .option("driver", "org.postgresql.Driver") \
+                .mode("overwrite") \
+                .save()
+    
+        # To truncate emp_data_trans_backup using Spark
+        spark.sql("SET spark.sql.legacy.allowNonEmptyLocationInCTAS = true")  # Sometimes needed in newer Spark versions
+    
+        spark.read \
+            .jdbc(url=pg_url, table="emp_data_trans_backup", properties=pg_properties) \
+            .limit(0) \
+            .write \
+            .jdbc(url=pg_url, table="emp_data_trans_backup", mode="overwrite", properties=pg_properties)
+    
+        print("emp_data_trans_backup truncated.")
+        
+    except Exception as e:
+        print("Write failed:", e)
+    
+    
+    # Move processed files in S3
+    try:
+        dest_prefix = "bronze/emp_data/processed/"
+        response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                source_key = obj['Key']
+                if source_key.endswith('/'):
+                    continue
+                file_name = source_key.split('/')[-1]
+                destination_key = f"{dest_prefix}{file_name}"
+    
+                s3.copy_object(
+                    Bucket=bucket_name,
+                    CopySource={'Bucket': bucket_name, 'Key': source_key},
+                    Key=destination_key
+                )
+                s3.delete_object(Bucket=bucket_name, Key=source_key)
+                print(f"Moved {source_key} to {destination_key}")
+        else:
+            print("No files found in the source folder.")
+    except Exception as e:
+        print("S3 file move error:", str(e))
+        raise
+    
+    # Commit the Glue job
+    try:
+        job.commit()
+        print("Glue job committed successfully.")
+    except Exception as e:
+        print("Job commit error:", str(e))
+        raise

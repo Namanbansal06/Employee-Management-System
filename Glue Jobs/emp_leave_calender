@@ -1,0 +1,139 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import *
+from awsglue.utils import getResolvedOptions
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
+
+# Initialize Spark & Glue contexts
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init("JOB_NAME", args)
+
+# S3 paths (update with actual bucket name)
+bucket_name = "poc-bootcamp-capstone-group4"
+unprocessed_prefix = "bronze/emp_leave_calender/unprocessed/"
+processed_prefix = "bronze/emp_leave_calender/processed/"
+
+# Load raw calendar data
+schema = StructType([
+    StructField("reason", StringType(), True),
+    StructField("date", DateType(), True)
+])
+
+df_new_raw = spark.read.schema(schema).csv(f"s3://{bucket_name}/{unprocessed_prefix}", header=True)
+
+s3 = boto3.client('s3')
+prefix = "bronze/emp_leave_calender/unprocessed/"
+
+response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+
+if 'Contents' not in response or all(obj['Key'].endswith('/') for obj in response['Contents']):
+    print("No files found in the bronze/unprocessed path. Exiting the job.")
+    job.commit()
+else:
+    
+    # Optional: filter invalid data (if any)
+    df_new = df_new_raw.filter(col("date").isNotNull() & col("reason").isNotNull())
+    df_new = df_new.withColumn("leave_year", year(col("date")))
+    
+    pg_url = pg_url
+    pg_properties = {
+        "user": db_user,
+        "password": db_pass,
+        "driver": "org.postgresql.Driver"
+    }
+    table_name = "emp_leave_calendar"
+    
+    try:
+        df_existing = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+        print("naman this is an existing psql db",df_existing.show())
+        df_combined = df_existing.unionByName(df_new)
+        historical_exists = True
+    except Exception as e:
+        print("No historical data found or error reading:", str(e))
+        df_combined = df_new
+        historical_exists = False
+    
+    # Deduplicate on date (keep the latest reason)
+    window_spec = Window.partitionBy("date").orderBy(col("reason").desc())
+    df_partitioned = df_combined.withColumn("row_num", row_number().over(window_spec)) \
+                          .filter(col("row_num") == 1) \
+                          .drop("row_num")
+    
+    print(df_partitioned.printSchema())
+    
+    # Write using _year as partition, then drop it from actual data
+    
+    try:
+        df_partitioned.write.jdbc(
+            url=pg_url,
+            table=table_name,
+            mode="append",
+            properties=pg_properties
+        )
+        print("Data successfully written to PostgreSQL table:", table_name)
+    except Exception as e:
+        print("Error while writing to PostgreSQL table:", table_name)
+        print("Exception message:", str(e))
+    
+    # Move processed files
+    s3 = boto3.client('s3')
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=unprocessed_prefix)
+    
+    if 'Contents' in response:
+        for obj in response['Contents']:
+            source_key = obj['Key']
+            if source_key.endswith('/'):
+                continue
+            file_name = source_key.split('/')[-1]
+            destination_key = f"{processed_prefix}{file_name}"
+    
+            # Copy to processed
+            s3.copy_object(
+                Bucket=bucket_name,
+                CopySource={'Bucket': bucket_name, 'Key': source_key},
+                Key=destination_key
+            )
+    
+            # Delete original
+            s3.delete_object(Bucket=bucket_name, Key=source_key)
+            print(f"Moved {source_key} to {destination_key}")
+    else:
+        print("No new files found to process.")
+    
+    job.commit()

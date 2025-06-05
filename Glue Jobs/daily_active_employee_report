@@ -1,0 +1,110 @@
+import sys
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.sql.functions import *
+
+# ---- Job args ----
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+
+
+# ---- Glue Context ----
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Load existing data from PostgreSQL
+pg_url = pg_url
+pg_properties = {
+    "user": db_user,
+    "password": db_pass,
+    "driver": "org.postgresql.Driver"
+}
+table_name = "emp_time_data"
+table_name2 = "emp_data_trans"
+# table_name3 = "emp_leave_data"
+table_name4 = "active_employee_report"
+
+try:
+    emp_df = spark.read.jdbc(url=pg_url, table=table_name2, properties=pg_properties)
+    print("data fetch from db successfuly")
+except:
+    print("failed to fetch db")
+    
+try:
+    timeframe_df = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+    print("data fetch from db successfuly")
+except:
+    print("failed to fetch db")
+    
+# try:
+#     leave_df = spark.read.jdbc(url=pg_url, table=table_name3, properties=pg_properties)
+#     print("data fetch from db successfuly")
+# except:
+#     print("failed to fetch db")
+
+# curr_ts = current_timestamp()
+curr_ts = to_timestamp(lit(args['curr_ts']))
+today_date = to_date(curr_ts)
+
+
+# # Filter employees who are on leave today 
+# on_leave_today = leave_df.filter(
+#     (to_date(col("date")) == today_date) &
+#     (col("status") == "ACTIVE")
+# ).select("emp_id").distinct()
+
+# Filter active employees (excluding those on leave today) 
+active_df = timeframe_df.filter(
+    (col("start_date") <= curr_ts) &
+    ((col("end_date").isNull()) | (col("end_date") >= curr_ts))
+)
+# .join(on_leave_today, on="emp_id", how="left_anti")
+
+joined_df = active_df.join(emp_df, on="emp_id", how="inner")
+final_df = active_df.groupBy("designation").agg(countDistinct("emp_id").alias("no_of_active_emp"))
+final_df.show()
+    
+try:
+    final_df.write.jdbc(
+        url=pg_url,
+        table=table_name4,
+        mode="overwrite",
+        properties=pg_properties
+    )
+    print("Data successfully written to PostgreSQL table:", table_name4)
+except Exception as e:
+    print("Error while writing to PostgreSQL table:", table_name4)
+    print("Exception message:", str(e))
+
+job.commit()

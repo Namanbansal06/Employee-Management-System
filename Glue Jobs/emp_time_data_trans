@@ -1,0 +1,235 @@
+
+import sys
+import boto3
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from awsglue.job import Job
+from datetime import datetime
+# import psycopg2
+
+# Glue boilerplate
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+
+bucket_name = "poc-bootcamp-capstone-group4"
+bronze_path = f"s3://{bucket_name}/bronze/emp_time_data/unprocessed/"
+processed_path = f"s3://{bucket_name}/bronze/emp_time_data/processed/"
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Load new incremental data
+schema = StructType([
+    StructField("emp_id", StringType(), True),
+    StructField("designation", StringType(), True),
+    StructField("start_date", LongType(), True),
+    StructField("end_date", LongType(), True),
+    StructField("salary", IntegerType(), True)
+])
+
+df_new = spark.read.option("header", True).schema(schema).csv(bronze_path)
+
+s3 = boto3.client('s3')
+prefix = "bronze/emp_time_data/unprocessed/"
+
+response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+
+if 'Contents' not in response or all(obj['Key'].endswith('/') for obj in response['Contents']):
+    print("No files found in the bronze/unprocessed path. Exiting the job.")
+    job.commit()
+
+else:
+    # Convert Unix timestamps to dates
+    df_new = df_new \
+        .withColumn("start_date", to_date(from_unixtime(col("start_date").cast("long")))) \
+        .withColumn("end_date", to_date(from_unixtime(col("end_date").cast("long"))))
+    
+    # Drop duplicates, keep highest salary
+    windowSpec = Window.partitionBy("emp_id", "start_date", "end_date") \
+        .orderBy(col("salary").cast("int").desc())
+    
+    df_new = df_new.withColumn("row_num", row_number().over(windowSpec)).filter("row_num = 1").drop("row_num")
+    
+    # Add empty status column
+    df_new = df_new.withColumn("status", lit(None).cast("string"))
+
+    # Load existing data from PostgreSQL
+    pg_url = pg_url
+    pg_properties = {
+        "user": db_user,
+        "password": db_pass,
+        "driver": "org.postgresql.Driver"
+    }
+    table_name = "emp_time_data"
+    
+    normal_df_existing = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+    # putting data into backup table
+    try:
+        normal_df_existing.write \
+            .jdbc(url=pg_url, table="emp_timeframe_df_backup", mode="append", properties=pg_properties)
+        
+        print("emp_timeframe_df_backup write successful.")
+    
+    except Exception as e:
+        print("Write failed:", e)
+        
+    try:
+        df_existing = spark.read.jdbc(url=pg_url, table="emp_timeframe_df_backup", properties=pg_properties)
+            
+        print("naman this is an existing psql db",df_existing.count())
+        historical_exists = True
+    except Exception as e:
+        print("No historical data found or error reading:", str(e))
+        df_existing = spark.createDataFrame([], df_new.schema)
+        historical_exists = False
+    
+    # Ensure df_existing has 'status' column
+    if "status" not in df_existing.columns:
+        df_existing = df_existing.withColumn("status", lit(None).cast("string"))
+    
+    # Combine old and new data
+    df_all = df_existing.unionByName(df_new)
+    df_all = df_all.dropDuplicates()
+    
+    # Use ascending start_date to compute next_start_date correctly
+    windowEmpAsc = Window.partitionBy("emp_id").orderBy(col("start_date").asc())
+    windowStatusDesc = Window.partitionBy("emp_id").orderBy(col("start_date").desc())
+    windowEmpCustom = Window.partitionBy("emp_id").orderBy(
+        col("start_date").asc(),
+        when(col("end_date").isNull(), 1).otherwise(0).asc()
+    )
+    
+    df_all = df_all.withColumn("row_order", row_number().over(windowEmpCustom))
+    df_all = df_all.orderBy("emp_id", "row_order").drop("row_order")
+    df_all = df_all.withColumn("next_start_date", lead("start_date").over(windowEmpAsc))
+    
+    
+    # Fill null end_dates using next_start_date
+    df_all = df_all.withColumn(
+        "end_date",
+        when(
+            col("next_start_date").isNotNull(),
+            col("next_start_date")
+        ).otherwise(col("end_date"))
+    )
+    
+    # Set status column: top row with NULL end_date = ACTIVE, rest = INACTIVE
+    df_all = df_all.withColumn(
+        "status",
+        when( (col("end_date").isNull()), "ACTIVE").otherwise("INACTIVE")
+    )
+    
+    # Final cleanup
+    df_final = df_all.drop("next_start_date")
+    df_final = df_final.withColumn("row_num", row_number().over(windowSpec)).filter("row_num = 1").drop("row_num")
+    df_final = df_final.filter((col("start_date") != col("end_date")) | col("end_date").isNull())
+    print("this is the final count", df_final.count())
+    
+    try:
+        if df_final.rdd.isEmpty():
+            print("Transformed DataFrame is empty. Restoring original data from backup.")
+            # Write backup data back
+            normal_df_existing.write \
+                .format("jdbc") \
+                .option("url", pg_url) \
+                .option("dbtable", "emp_time_data") \
+                .option("user", db_user) \
+                .option("password", db_pass) \
+                .option("driver", "org.postgresql.Driver") \
+                .mode("overwrite") \
+                .save()
+        else:
+            print("Writing transformed data to df_existing...")
+            df_final.write \
+                .format("jdbc") \
+                .option("url", pg_url) \
+                .option("dbtable", "emp_time_data") \
+                .option("user", db_user) \
+                .option("password", db_pass) \
+                .option("driver", "org.postgresql.Driver") \
+                .mode("overwrite") \
+                .save()
+    
+        # To truncate emp_timeframe_df_backup using Spark
+        spark.sql("SET spark.sql.legacy.allowNonEmptyLocationInCTAS = true")  # Sometimes needed in newer Spark versions
+    
+        spark.read \
+            .jdbc(url=pg_url, table="emp_timeframe_df_backup", properties=pg_properties) \
+            .limit(0) \
+            .write \
+            .jdbc(url=pg_url, table="emp_timeframe_df_backup", mode="overwrite", properties=pg_properties)
+    
+        print("emp_timeframe_df_backup truncated.")
+        
+    except Exception as e:
+        print("Write failed:", e)
+        
+        
+    s3 = boto3.client('s3')
+    
+    # Corrected prefixes to match actual path
+    prefix = "bronze/emp_time_data/unprocessed/"
+    dest_prefix = "bronze/emp_time_data/processed/"
+    
+    # List all files in the source path
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+    
+    if 'Contents' in response:
+        for obj in response['Contents']:
+            source_key = obj['Key']
+    
+            # Skip folders
+            if source_key.endswith('/'):
+                continue
+    
+            file_name = source_key.split('/')[-1]
+            destination_key = f"{dest_prefix}{file_name}"
+    
+            # Copy each file
+            s3.copy_object(
+                Bucket=bucket_name,
+                CopySource={'Bucket': bucket_name, 'Key': source_key},
+                Key=destination_key
+            )
+    
+            # Delete original file
+            s3.delete_object(Bucket=bucket_name, Key=source_key)
+    
+            print(f"Moved {source_key} to {destination_key}")
+    else:
+        print("No files found in the source folder.")
+    
+    job.commit()

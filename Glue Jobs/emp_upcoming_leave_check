@@ -1,0 +1,169 @@
+import sys
+from datetime import datetime, timedelta, date
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.sql.functions import col, to_date, lit, countDistinct, dayofweek, year
+from pyspark.sql import Row
+from pyspark.sql.types import StructType, StructField, DateType
+
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_user',
+    'db_pass',
+    'db_host',
+    'pg_url',
+    'curr_ts',
+    'start_date',
+    'end_of_year',
+    'start_of_year',
+    'today',
+    'CURRENT_YEAR'
+])
+
+# Accessing the arguments
+db_user = args['db_user']
+db_pass = args['db_pass']
+db_host = args['db_host']
+pg_url = args['pg_url']
+curr_ts = args['curr_ts']
+start_date = args['start_date']
+end_of_year = args['end_of_year']
+start_of_year = args['start_of_year']
+today = args['today']
+CURRENT_YEAR = args['CURRENT_YEAR']
+
+# Example of logging the received arguments
+print(f"Received arguments: {args}")
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# --- Define constants ---
+CURRENT_YEAR = int(CURRENT_YEAR)
+start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+end_of_year = datetime.strptime(end_of_year, "%Y-%m-%d").date()
+
+# Load existing data from PostgreSQL
+pg_url = pg_url
+pg_properties = {
+    "user": db_user,
+    "password": db_pass,
+    "driver": "org.postgresql.Driver"
+}
+table_name = "emp_leave_data"
+table_name2 = "emp_leave_calendar"
+table_name3 ="upcoming_leave_check"
+
+# --- Load employee leave data ---
+try:
+    leave_df = spark.read.jdbc(url=pg_url, table=table_name, properties=pg_properties)
+    leave_df = leave_df.withColumn("date", to_date(col("date")))
+    print("leave data reading successfull")
+    
+except Exception as e:
+    print(f"Error reading leave data: {str(e)}")
+    job.commit()
+    sys.exit(1)
+
+# --- Filter current year & active leaves ---
+try:
+    leave_df = leave_df.filter(
+        (col("status") == "ACTIVE") & (col("date") >= lit(start_date))
+    ).select("emp_id", "date").dropDuplicates(["emp_id", "date"])
+    
+except Exception as e:
+    print(f"Error filtering leave data: {str(e)}")
+    job.commit()
+    sys.exit(1)
+
+# --- Load holiday calendar for 2024 partition ---
+try:
+    holiday_df = spark.read.jdbc(url=pg_url, table=table_name2, properties=pg_properties)
+    holiday_df = holiday_df.withColumn("holiday_date", to_date(col("date")))
+    print("holiday_df data reading successfull")
+    
+except Exception as e:
+    print(f"Error reading holiday calendar: {str(e)}")
+    job.commit()
+    sys.exit(1)
+
+# --- Filter out weekends and holidays from leave data ---
+try:
+    leave_df = leave_df.withColumn("dow", dayofweek(col("date"))) \
+        .filter((col("dow") != 1) & (col("dow") != 7))  # 1=Sunday, 7=Saturday
+
+    leave_df = leave_df.join(holiday_df, leave_df.date == holiday_df.holiday_date, "left_anti")
+except Exception as e:
+    print(f"Error filtering weekends and holidays: {str(e)}")
+    job.commit()
+    sys.exit(1)
+
+# --- Calculate upcoming working days in year ---
+try:
+    # today = date.today()
+    today = start_date
+
+    # Collect holiday dates into a list
+    if not holiday_df.rdd.isEmpty():
+        holiday_list = [row['holiday_date'] for row in holiday_df.select("holiday_date").collect()]
+    else:
+        print("Warning: Holiday calendar is empty!")
+        holiday_list = []
+
+    # Generate working day list
+    working_days = []
+    current = today
+    while current <= end_of_year:
+        if current.weekday() < 5 and current not in holiday_list:  # Mon-Fri
+            working_days.append(Row(date=current))
+        current += timedelta(days=1)
+
+    # Convert list to DataFrame
+    schema = StructType([StructField("date", DateType(), True)])
+    working_days_df = spark.createDataFrame(working_days, schema=schema)
+    working_days_count = working_days_df.count()
+    print("wdc", working_days_count)
+
+except Exception as e:
+    print(f"Error calculating working days: {str(e)}")
+    working_days_count = 0
+    job.commit()
+    
+# --- Count unique upcoming leave days per employee ---
+try:
+    emp_leave_count_df = leave_df.groupBy("emp_id").agg(countDistinct("date").alias("upcoming_leaves"))
+except Exception as e:
+    print(f"Error counting leaves per employee: {str(e)}")
+    job.commit()
+    sys.exit(1)
+
+# --- Filter employees exceeding 8% leave threshold ---
+try:
+    threshold = working_days_count * 0.08
+    print("thresh",threshold)
+    result_df = emp_leave_count_df.filter(col("upcoming_leaves") > threshold)
+except Exception as e:
+    print(f"Error filtering based on leave threshold: {str(e)}")
+    job.commit()
+    sys.exit(1)
+
+# --- Optional: write result to S3 ---
+try:
+    result_df.write.jdbc(
+        url=pg_url,
+        table=table_name3,
+        mode="overwrite",
+        properties=pg_properties
+    )
+    print("Data successfully written to PostgreSQL table:", table_name3)
+except Exception as e:
+    print("Error while writing to PostgreSQL table:", table_name3)
+    print("Exception message:", str(e))
+
+# --- Commit job ---
+job.commit()
